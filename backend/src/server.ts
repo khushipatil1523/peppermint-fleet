@@ -370,15 +370,53 @@ await app.listen({
   host: '0.0.0.0',
 });
 
-const wss =
-  new WebSocketServer({
-    server: app.server,
-    path: '/ws',
-  });
+const wss = new WebSocketServer({
+  noServer: true,
+});
+
+app.server.on(
+  'upgrade',
+  (request, socket, head) => {
+    const url = new URL(
+      request.url ?? '/',
+      `http://${request.headers.host ?? 'localhost'}`,
+    );
+
+    app.log.info(
+      {
+        path: url.pathname,
+        host: request.headers.host,
+      },
+      'WebSocket upgrade request',
+    );
+
+    if (url.pathname !== '/ws') {
+      socket.destroy();
+      return;
+    }
+
+    wss.handleUpgrade(
+      request,
+      socket,
+      head,
+      (ws) => {
+        wss.emit(
+          'connection',
+          ws,
+          request,
+        );
+      },
+    );
+  },
+);
 
 wss.on(
   'connection',
   (ws) => {
+    app.log.info(
+      'WebSocket client connected',
+    );
+
     broadcaster.add(ws);
 
     ws.send(
@@ -392,10 +430,27 @@ wss.on(
 
     ws.on(
       'close',
-      () => broadcaster.remove(ws),
+      () => {
+        app.log.info(
+          'WebSocket client disconnected',
+        );
+
+        broadcaster.remove(ws);
+      },
+    );
+
+    ws.on(
+      'error',
+      (error) => {
+        app.log.error(
+          error,
+          'WebSocket client error',
+        );
+      },
     );
   },
 );
+
 
 const offlineInterval =
   setInterval(() => {

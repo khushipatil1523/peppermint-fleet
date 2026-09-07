@@ -23,6 +23,28 @@ await app.register(cors, {
   origin: env.corsOrigin,
 });
 
+/*
+ * --------------------------------------------------
+ * DIAGNOSTIC HTTP REQUEST LOGGING
+ * --------------------------------------------------
+ *
+ * Helps verify that production requests are actually
+ * reaching this Fastify instance.
+ */
+app.addHook(
+  'onRequest',
+  async (request) => {
+    app.log.info(
+      {
+        method: request.method,
+        url: request.url,
+        origin: request.headers.origin,
+      },
+      'HTTP REQUEST',
+    );
+  },
+);
+
 const fleet = new FleetState();
 const broadcaster = new Broadcaster();
 
@@ -44,6 +66,13 @@ function processUpdate(
     knownTypes.get(update.robot_id);
 
   if (!robotType) {
+    app.log.warn(
+      {
+        robot_id: update.robot_id,
+      },
+      'UPDATE REJECTED: UNKNOWN ROBOT TYPE',
+    );
+
     return null;
   }
 
@@ -91,18 +120,51 @@ function processUpdate(
   return state;
 }
 
-app.get('/health', async () => ({
-  ok: true,
-  service: 'fleet-backend',
-  robots: fleet.all().length,
-  websocket_clients:
-    broadcaster.count(),
-  time: new Date().toISOString(),
-}));
+/*
+ * --------------------------------------------------
+ * HEALTH
+ * --------------------------------------------------
+ */
 
-app.get('/robots', async () => ({
-  robots: fleet.all(),
-}));
+app.get(
+  '/health',
+  async () => ({
+    ok: true,
+    service: 'fleet-backend',
+    robots: fleet.all().length,
+    websocket_clients:
+      broadcaster.count(),
+    time: new Date().toISOString(),
+  }),
+);
+
+/*
+ * --------------------------------------------------
+ * CURRENT FLEET STATE
+ * --------------------------------------------------
+ */
+
+app.get(
+  '/robots',
+  async () => {
+    app.log.info(
+      {
+        robotCount: fleet.all().length,
+      },
+      'ROBOTS ENDPOINT HIT',
+    );
+
+    return {
+      robots: fleet.all(),
+    };
+  },
+);
+
+/*
+ * --------------------------------------------------
+ * SINGLE ROBOT
+ * --------------------------------------------------
+ */
 
 app.get<{
   Params: {
@@ -126,6 +188,12 @@ app.get<{
     return robot;
   },
 );
+
+/*
+ * --------------------------------------------------
+ * ROBOT HISTORY
+ * --------------------------------------------------
+ */
 
 app.get<{
   Params: {
@@ -176,6 +244,12 @@ app.get<{
   },
 );
 
+/*
+ * --------------------------------------------------
+ * ROBOT INGESTION
+ * --------------------------------------------------
+ */
+
 app.post<{
   Body: RobotUpdate;
 }>(
@@ -186,6 +260,10 @@ app.post<{
         request.body,
       )
     ) {
+      app.log.warn(
+        'INVALID ROBOT UPDATE',
+      );
+
       return reply
         .code(400)
         .send({
@@ -215,6 +293,12 @@ app.post<{
   },
 );
 
+/*
+ * --------------------------------------------------
+ * SIMULATOR
+ * --------------------------------------------------
+ */
+
 const simulator = new Simulator(
   `http://127.0.0.1:${env.port}/ingest`,
   {
@@ -226,10 +310,22 @@ const simulator = new Simulator(
   },
 );
 
+/*
+ * --------------------------------------------------
+ * CONFIG
+ * --------------------------------------------------
+ */
+
 app.get(
   '/config',
   async () => simulator.config(),
 );
+
+/*
+ * --------------------------------------------------
+ * ADMIN RUNTIME CONFIG
+ * --------------------------------------------------
+ */
 
 app.post<{
   Body: Partial<RuntimeConfig>;
@@ -363,12 +459,18 @@ app.post<{
   },
 );
 
-const port = env.port;
-
-await app.listen({
-  port,
-  host: '0.0.0.0',
-});
+/*
+ * --------------------------------------------------
+ * WEBSOCKET
+ * --------------------------------------------------
+ *
+ * WebSocket uses the SAME HTTP server as Fastify.
+ * There is no separate WebSocket deployment.
+ *
+ * We explicitly handle HTTP upgrade requests so
+ * production logs can tell us whether Render is
+ * forwarding the WebSocket connection correctly.
+ */
 
 const wss = new WebSocketServer({
   noServer: true,
@@ -376,7 +478,11 @@ const wss = new WebSocketServer({
 
 app.server.on(
   'upgrade',
-  (request, socket, head) => {
+  (
+    request,
+    socket,
+    head,
+  ) => {
     const url = new URL(
       request.url ?? '/',
       `http://${request.headers.host ?? 'localhost'}`,
@@ -386,27 +492,48 @@ app.server.on(
       {
         path: url.pathname,
         host: request.headers.host,
+        origin: request.headers.origin,
       },
-      'WebSocket upgrade request',
+      'WEBSOCKET UPGRADE RECEIVED',
     );
 
     if (url.pathname !== '/ws') {
+      app.log.warn(
+        {
+          path: url.pathname,
+        },
+        'REJECTING NON-WEBSOCKET PATH',
+      );
+
       socket.destroy();
       return;
     }
 
-    wss.handleUpgrade(
-      request,
-      socket,
-      head,
-      (ws) => {
-        wss.emit(
-          'connection',
-          ws,
-          request,
-        );
-      },
-    );
+    try {
+      wss.handleUpgrade(
+        request,
+        socket,
+        head,
+        (ws) => {
+          app.log.info(
+            'WEBSOCKET UPGRADE ACCEPTED',
+          );
+
+          wss.emit(
+            'connection',
+            ws,
+            request,
+          );
+        },
+      );
+    } catch (error) {
+      app.log.error(
+        error,
+        'WEBSOCKET UPGRADE FAILED',
+      );
+
+      socket.destroy();
+    }
   },
 );
 
@@ -414,11 +541,15 @@ wss.on(
   'connection',
   (ws) => {
     app.log.info(
-      'WebSocket client connected',
+      'WEBSOCKET CLIENT CONNECTED',
     );
 
     broadcaster.add(ws);
 
+    /*
+     * Send current fleet state immediately
+     * when a dashboard connects.
+     */
     ws.send(
       JSON.stringify({
         type: 'snapshot',
@@ -430,9 +561,14 @@ wss.on(
 
     ws.on(
       'close',
-      () => {
+      (code, reason) => {
         app.log.info(
-          'WebSocket client disconnected',
+          {
+            code,
+            reason:
+              reason.toString(),
+          },
+          'WEBSOCKET CLIENT DISCONNECTED',
         );
 
         broadcaster.remove(ws);
@@ -444,13 +580,58 @@ wss.on(
       (error) => {
         app.log.error(
           error,
-          'WebSocket client error',
+          'WEBSOCKET CLIENT ERROR',
         );
       },
     );
   },
 );
 
+/*
+ * --------------------------------------------------
+ * SERVER STARTUP
+ * --------------------------------------------------
+ */
+
+const port = env.port;
+
+app.log.info(
+  {
+    port,
+    corsOrigin: env.corsOrigin,
+    fleetSize: env.fleetSize,
+    updateIntervalMs:
+      env.updateIntervalMs,
+    payloadBytes:
+      env.payloadBytes,
+  },
+  'SERVER CONFIG',
+);
+
+app.log.info(
+  {
+    routes: app.printRoutes(),
+  },
+  'REGISTERED FASTIFY ROUTES',
+);
+
+await app.listen({
+  port,
+  host: '0.0.0.0',
+});
+
+app.log.info(
+  {
+    address: app.server.address(),
+  },
+  'HTTP SERVER LISTENING',
+);
+
+/*
+ * --------------------------------------------------
+ * OFFLINE DETECTION
+ * --------------------------------------------------
+ */
 
 const offlineInterval =
   setInterval(() => {
@@ -473,6 +654,12 @@ const offlineInterval =
     }
   }, 1000);
 
+/*
+ * --------------------------------------------------
+ * START SIMULATOR
+ * --------------------------------------------------
+ */
+
 simulator.start();
 
 app.log.info(
@@ -482,6 +669,12 @@ app.log.info(
   },
   'Fleet simulator started',
 );
+
+/*
+ * --------------------------------------------------
+ * GRACEFUL SHUTDOWN
+ * --------------------------------------------------
+ */
 
 process.on(
   'SIGTERM',
@@ -510,6 +703,12 @@ process.on(
     void app.close();
   },
 );
+
+/*
+ * --------------------------------------------------
+ * TYPES
+ * --------------------------------------------------
+ */
 
 type RobotStateHistory = {
   timestamp: number;
